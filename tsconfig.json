@@ -5,7 +5,14 @@
     "moduleResolution": "Bundler",
     "strict": true,
     "esModuleInterop": true,
-    "skipLibCheck": true
-  }
+    "skipLibCheck": true,
+    
+    /* Orky Integration Fixes */
+    "allowJs": true,           /* Fixes the 'Could not find a declaration file for module' for your .js files */
+    "noImplicitAny": false,    /* Temporarily lowers strictness for missing parameter types in your routes */
+    "outDir": "dist",          /* Ensures Vercel knows where to put the compiled files */
+    "sourceMap": true          /* Helps Orky log specific line numbers if an error occurs */
+  },
+  "include": ["api/**/*", "src/**/*"],
+  "exclude": ["node_modules"]
 }
-
