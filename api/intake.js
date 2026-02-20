@@ -13,13 +13,23 @@ export default async function handler(req, res) {
     // The new SDK requires passing the key inside an object
     const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
-    // 2. READ GOOGLE DOC
+    // 2. READ GOOGLE DOC (Service Account Authentication)
+    // We use the credentials from Vercel environment variables directly
     const auth = new google.auth.GoogleAuth({
+      credentials: {
+        client_email: process.env.GOOGLE_CLIENT_EMAIL,
+        // Critical: Vercel often escapes \n, so we replace it with real newlines
+        private_key: process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n'),
+      },
+      projectId: process.env.GOOGLE_PROJECT_ID,
       scopes: ['https://www.googleapis.com/auth/documents.readonly'],
     });
+
     const docs = google.docs({ version: 'v1', auth });
     const doc = await docs.documents.get({ documentId: fileId });
-    const fullText = doc.data.body.content.map(c => c.paragraph?.elements?.map(e => e.textRun?.content).join('')).join('');
+    const fullText = doc.data.body.content
+      .map(c => c.paragraph?.elements?.map(e => e.textRun?.content).join(''))
+      .join('');
 
     // 3. TRANSFORM WITH GEMINI
     const prompt = `Analyze this PDD: "${fullText}". 
@@ -27,13 +37,13 @@ export default async function handler(req, res) {
     Format: [{"type": "Epic", "summary": "...", "stories": [{"summary": "...", "description": "..."}]}]
     Output ONLY valid JSON. No markdown backticks.`;
     
-    // NEW SYNTAX: ai.models.generateContent instead of genAI.getGenerativeModel
+    // Using gemini-2.0-flash for speed and resilience during service disruptions
     const result = await ai.models.generateContent({
-      model: "gemini-2.0-flash", // Flash is highly recommended for speed in 2026
+      model: "gemini-2.0-flash", 
       contents: [{ role: "user", parts: [{ text: prompt }] }]
     });
 
-    let resultText = result.text; // The new SDK returns text directly on the response
+    let resultText = result.text; 
 
     // Cleaning step: Remove markdown code blocks if Gemini includes them
     const cleanedJson = resultText.replace(/```json|```/g, "").trim();
@@ -69,7 +79,7 @@ export default async function handler(req, res) {
               }] 
             },
             issuetype: { name: 'Story' },
-            parent: { key: epicKey } 
+            parent: { key: epicKey } // Modern Jira API links Story to Epic via 'parent'
           }
         }, { headers: { 'Authorization': `Basic ${jiraAuth}` } });
       }
