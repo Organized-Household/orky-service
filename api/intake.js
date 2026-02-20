@@ -9,10 +9,9 @@ export default async function handler(req, res) {
   const { fileId, projectKey } = req.body;
 
   try {
-    // 1. INITIALIZE GEMINI (Fixed the TypeError: genAI.getGenerativeModel is not a function)
-    const genAI = new GoogleGenAI(process.env.GEMINI_API_KEY);
-    // Using gemini-1.5-flash for speed and stability during the current "Pro" outage
-    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+    // 1. INITIALIZE GEMINI (Fixed for 2026 SDK syntax)
+    // The new SDK requires passing the key inside an object
+    const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
     // 2. READ GOOGLE DOC
     const auth = new google.auth.GoogleAuth({
@@ -28,12 +27,16 @@ export default async function handler(req, res) {
     Format: [{"type": "Epic", "summary": "...", "stories": [{"summary": "...", "description": "..."}]}]
     Output ONLY valid JSON. No markdown backticks.`;
     
-    const result = await model.generateContent(prompt);
-    let resultText = result.response.text();
+    // NEW SYNTAX: ai.models.generateContent instead of genAI.getGenerativeModel
+    const result = await ai.models.generateContent({
+      model: "gemini-2.0-flash", // Flash is highly recommended for speed in 2026
+      contents: [{ role: "user", parts: [{ text: prompt }] }]
+    });
+
+    let resultText = result.text; // The new SDK returns text directly on the response
 
     // Cleaning step: Remove markdown code blocks if Gemini includes them
-    const jsonMatch = resultText.match(/```json\n([\s\S]*?)\n```/) || resultText.match(/```\n([\s\S]*?)\n```/);
-    const cleanedJson = jsonMatch ? jsonMatch[1] : resultText;
+    const cleanedJson = resultText.replace(/```json|```/g, "").trim();
     const workItems = JSON.parse(cleanedJson);
 
     // 4. ENTER INTO JIRA
@@ -66,7 +69,7 @@ export default async function handler(req, res) {
               }] 
             },
             issuetype: { name: 'Story' },
-            parent: { key: epicKey } // Modern Jira API links Story to Epic via 'parent'
+            parent: { key: epicKey } 
           }
         }, { headers: { 'Authorization': `Basic ${jiraAuth}` } });
       }
