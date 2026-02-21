@@ -9,6 +9,7 @@
 //   Body: { epicKey: "ORKY-6", storySummary: "..." }
 //
 // Required env vars:
+// - ORKY_API_KEY
 // - JIRA_BASE_URL
 // - JIRA_EMAIL
 // - JIRA_API_TOKEN
@@ -26,6 +27,22 @@ function mustEnv(name) {
 function authHeader(email, token) {
   const basic = Buffer.from(`${email}:${token}`).toString("base64");
   return `Basic ${basic}`;
+}
+
+function requireOrkyAuth(req) {
+  const expected = mustEnv("ORKY_API_KEY");
+
+  // Accept either:
+  // 1) Authorization: Bearer <key>
+  // 2) x-orky-key: <key>
+  const auth = req.headers?.authorization || "";
+  const bearer = auth.toLowerCase().startsWith("bearer ") ? auth.slice(7).trim() : "";
+  const xKey = req.headers?.["x-orky-key"];
+
+  if (bearer === expected) return true;
+  if (xKey === expected) return true;
+
+  return false;
 }
 
 async function jiraFetch(jira, path, init = {}) {
@@ -105,6 +122,14 @@ export default async function handler(req, res) {
       return res.status(405).json({ ok: false, error: "Use POST" });
     }
 
+    // ✅ Orky API authentication happens HERE (before any Jira calls)
+    if (!requireOrkyAuth(req)) {
+      return res.status(401).json({
+        ok: false,
+        error: "Unauthorized. Provide Authorization: Bearer <ORKY_API_KEY> or x-orky-key.",
+      });
+    }
+
     const jira = {
       baseUrl: mustEnv("JIRA_BASE_URL"),
       email: mustEnv("JIRA_EMAIL"),
@@ -118,7 +143,11 @@ export default async function handler(req, res) {
     const epicKey = req.body?.epicKey;
     if (epicKey) {
       // Validate epic exists (optional but nice)
-      await jiraFetch(jira, `/rest/api/3/issue/${encodeURIComponent(epicKey)}?fields=key,issuetype`, { method: "GET" });
+      await jiraFetch(
+        jira,
+        `/rest/api/3/issue/${encodeURIComponent(epicKey)}?fields=key,issuetype`,
+        { method: "GET" }
+      );
 
       const storySummary = req.body?.storySummary || `Story under ${epicKey}`;
       const storyDescription = req.body?.storyDescription || `Created by Orky API under Epic ${epicKey}.`;
