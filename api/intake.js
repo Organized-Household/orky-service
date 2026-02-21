@@ -1,8 +1,21 @@
 // api/intake.js
 //
 // POST /api/intake
-// Creates Epic (and optionally Story) in TEAM-MANAGED Jira.
-// Auto-fills required "Reporter" by using the authenticated Jira user (/myself).
+//
+// Mode A (existing): create a new Epic (+ optional Story)
+//   Body: { epicSummary, ... }
+//
+// Mode B (new): create a Story under an existing Epic (team-managed)
+//   Body: { epicKey: "ORKY-6", storySummary: "..." }
+//
+// Required env vars:
+// - JIRA_BASE_URL
+// - JIRA_EMAIL
+// - JIRA_API_TOKEN
+// - JIRA_PROJECT_KEY
+//
+// Optional env var:
+// - CREATE_STORY_UNDER_EPIC  "true" | "false" (for Mode A only)
 
 function mustEnv(name) {
   const v = process.env[name];
@@ -99,6 +112,54 @@ export default async function handler(req, res) {
       projectKey: mustEnv("JIRA_PROJECT_KEY"),
     };
 
+    const myAccountId = await getMyAccountId(jira);
+
+    // ===== MODE B: Create Story under existing Epic =====
+    const epicKey = req.body?.epicKey;
+    if (epicKey) {
+      // Validate epic exists (optional but nice)
+      await jiraFetch(jira, `/rest/api/3/issue/${encodeURIComponent(epicKey)}?fields=key,issuetype`, { method: "GET" });
+
+      const storySummary = req.body?.storySummary || `Story under ${epicKey}`;
+      const storyDescription = req.body?.storyDescription || `Created by Orky API under Epic ${epicKey}.`;
+
+      const storyMeta = await getCreateMetaFields(jira, jira.projectKey, "Story");
+
+      const storyFields = {
+        project: { key: jira.projectKey },
+        summary: storySummary,
+        issuetype: { name: "Story" },
+        description: adf(storyDescription),
+        parent: { key: epicKey }, // team-managed link
+      };
+
+      if (storyMeta["reporter"]?.required) {
+        storyFields.reporter = { accountId: myAccountId };
+      }
+
+      const missing = missingRequired(storyMeta, storyFields);
+      if (missing.length > 0) {
+        return res.status(400).json({
+          ok: false,
+          error: "Jira reports additional required fields for Story.",
+          missingRequired: missing,
+        });
+      }
+
+      const created = await jiraFetch(jira, "/rest/api/3/issue", {
+        method: "POST",
+        body: JSON.stringify({ fields: storyFields }),
+      });
+
+      return res.status(200).json({
+        ok: true,
+        mode: "add-story",
+        epicKey,
+        story: created,
+      });
+    }
+
+    // ===== MODE A: Create Epic (existing behavior) =====
     const CREATE_STORY_UNDER_EPIC =
       (process.env.CREATE_STORY_UNDER_EPIC || "false").toLowerCase() === "true";
 
@@ -106,14 +167,6 @@ export default async function handler(req, res) {
     const epicDescription =
       req.body?.epicDescription || "Created by Orky via Vercel API (no DB logging yet).";
 
-    const storySummary = req.body?.storySummary || "Orky - First API Story";
-    const storyDescription =
-      req.body?.storyDescription || "Created under the Epic using parent=Epic (team-managed).";
-
-    // Fetch authenticated user accountId once; use it to satisfy required Reporter
-    const myAccountId = await getMyAccountId(jira);
-
-    // ---- EPIC ----
     const epicMeta = await getCreateMetaFields(jira, jira.projectKey, "Epic");
 
     const epicFields = {
@@ -123,13 +176,11 @@ export default async function handler(req, res) {
       description: adf(epicDescription),
     };
 
-    // Auto-fill Epic Name if Jira requires it
     const epicNameFieldId = findEpicNameFieldId(epicMeta);
     if (epicNameFieldId && epicMeta[epicNameFieldId]?.required) {
       epicFields[epicNameFieldId] = epicSummary;
     }
 
-    // Auto-fill Reporter if required
     if (epicMeta["reporter"]?.required) {
       epicFields.reporter = { accountId: myAccountId };
     }
@@ -148,19 +199,18 @@ export default async function handler(req, res) {
       body: JSON.stringify({ fields: epicFields }),
     });
 
-    const epicKey = epicCreate?.key;
+    const epicCreatedKey = epicCreate?.key;
 
-    // ---- STORY (optional) ----
     let storyCreate = null;
     if (CREATE_STORY_UNDER_EPIC) {
       const storyMeta = await getCreateMetaFields(jira, jira.projectKey, "Story");
 
       const storyFields = {
         project: { key: jira.projectKey },
-        summary: storySummary,
+        summary: req.body?.storySummary || "Orky - First API Story",
         issuetype: { name: "Story" },
-        description: adf(storyDescription),
-        parent: { key: epicKey },
+        description: adf(req.body?.storyDescription || "Created under the Epic (team-managed)."),
+        parent: { key: epicCreatedKey },
       };
 
       if (storyMeta["reporter"]?.required) {
@@ -185,6 +235,7 @@ export default async function handler(req, res) {
 
     return res.status(200).json({
       ok: true,
+      mode: "create-epic",
       epic: epicCreate,
       story: storyCreate,
       createdStory: CREATE_STORY_UNDER_EPIC,
