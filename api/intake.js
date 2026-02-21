@@ -1,18 +1,8 @@
 // api/intake.js
 //
-// Vercel Serverless Function: POST /api/intake
-//
-// Creates 1 Epic in a TEAM-MANAGED Jira project.
-// Optionally creates 1 Story under that Epic using `parent: { key: epicKey }`.
-//
-// Required env vars (you already have these):
-// - JIRA_BASE_URL        e.g. https://your-domain.atlassian.net
-// - JIRA_EMAIL
-// - JIRA_API_TOKEN
-// - JIRA_PROJECT_KEY
-//
-// Optional env var:
-// - CREATE_STORY_UNDER_EPIC  "true" | "false" (default false)
+// POST /api/intake
+// Creates Epic (and optionally Story) in TEAM-MANAGED Jira.
+// Auto-fills required "Reporter" by using the authenticated Jira user (/myself).
 
 function mustEnv(name) {
   const v = process.env[name];
@@ -52,18 +42,14 @@ async function jiraFetch(jira, path, init = {}) {
   return json;
 }
 
-// Atlassian Document Format (ADF) for description
 function adf(text) {
   return {
     type: "doc",
     version: 1,
-    content: [
-      { type: "paragraph", content: [{ type: "text", text }] },
-    ],
+    content: [{ type: "paragraph", content: [{ type: "text", text }] }],
   };
 }
 
-// Discover required fields for (projectKey, issueTypeName)
 async function getCreateMetaFields(jira, projectKey, issueTypeName) {
   const qs = new URLSearchParams({
     projectKeys: projectKey,
@@ -74,17 +60,29 @@ async function getCreateMetaFields(jira, projectKey, issueTypeName) {
   const meta = await jiraFetch(jira, `/rest/api/3/issue/createmeta?${qs}`);
   const proj = meta?.projects?.[0];
   const it = proj?.issuetypes?.[0];
-  const fields = it?.fields || {};
-  return fields;
+  return it?.fields || {};
 }
 
-// Heuristic: find an "Epic name" field if it exists
 function findEpicNameFieldId(fields) {
   for (const [fieldId, def] of Object.entries(fields)) {
     const name = (def?.name || "").toLowerCase();
     if (name.includes("epic") && name.includes("name")) return fieldId;
   }
   return null;
+}
+
+async function getMyAccountId(jira) {
+  const me = await jiraFetch(jira, "/rest/api/3/myself", { method: "GET" });
+  const accountId = me?.accountId;
+  if (!accountId) throw new Error("Could not determine Jira accountId from /myself");
+  return accountId;
+}
+
+function missingRequired(fieldsMeta, fieldsPayload) {
+  return Object.entries(fieldsMeta)
+    .filter(([, def]) => def?.required)
+    .filter(([fieldId]) => fieldsPayload[fieldId] === undefined)
+    .map(([fieldId, def]) => ({ fieldId, name: def?.name }));
 }
 
 export default async function handler(req, res) {
@@ -104,7 +102,6 @@ export default async function handler(req, res) {
     const CREATE_STORY_UNDER_EPIC =
       (process.env.CREATE_STORY_UNDER_EPIC || "false").toLowerCase() === "true";
 
-    // Optional request body overrides for fast testing
     const epicSummary = req.body?.epicSummary || "Orky - First API Epic";
     const epicDescription =
       req.body?.epicDescription || "Created by Orky via Vercel API (no DB logging yet).";
@@ -113,8 +110,11 @@ export default async function handler(req, res) {
     const storyDescription =
       req.body?.storyDescription || "Created under the Epic using parent=Epic (team-managed).";
 
-    // ---- 1) Create Epic (with createmeta required-field detection) ----
-    const epicMetaFields = await getCreateMetaFields(jira, jira.projectKey, "Epic");
+    // Fetch authenticated user accountId once; use it to satisfy required Reporter
+    const myAccountId = await getMyAccountId(jira);
+
+    // ---- EPIC ----
+    const epicMeta = await getCreateMetaFields(jira, jira.projectKey, "Epic");
 
     const epicFields = {
       project: { key: jira.projectKey },
@@ -123,24 +123,23 @@ export default async function handler(req, res) {
       description: adf(epicDescription),
     };
 
-    // If Jira requires an Epic Name field, populate it automatically
-    const epicNameFieldId = findEpicNameFieldId(epicMetaFields);
-    if (epicNameFieldId && epicMetaFields[epicNameFieldId]?.required) {
+    // Auto-fill Epic Name if Jira requires it
+    const epicNameFieldId = findEpicNameFieldId(epicMeta);
+    if (epicNameFieldId && epicMeta[epicNameFieldId]?.required) {
       epicFields[epicNameFieldId] = epicSummary;
     }
 
-    // If Jira reports other required fields, fail early with a helpful response
-    const missingEpicRequired = Object.entries(epicMetaFields)
-      .filter(([, def]) => def?.required)
-      .filter(([fieldId]) => epicFields[fieldId] === undefined)
-      .map(([fieldId, def]) => ({ fieldId, name: def?.name }));
+    // Auto-fill Reporter if required
+    if (epicMeta["reporter"]?.required) {
+      epicFields.reporter = { accountId: myAccountId };
+    }
 
-    if (missingEpicRequired.length > 0) {
+    const epicMissing = missingRequired(epicMeta, epicFields);
+    if (epicMissing.length > 0) {
       return res.status(400).json({
         ok: false,
         error: "Jira reports additional required fields for Epic.",
-        missingRequired: missingEpicRequired,
-        tip: "Reply with this JSON and I’ll update intake.js to include those fields safely.",
+        missingRequired: epicMissing,
       });
     }
 
@@ -151,31 +150,30 @@ export default async function handler(req, res) {
 
     const epicKey = epicCreate?.key;
 
-    // ---- 2) Optionally create Story under Epic (TEAM-MANAGED uses parent) ----
+    // ---- STORY (optional) ----
     let storyCreate = null;
-
     if (CREATE_STORY_UNDER_EPIC) {
-      const storyMetaFields = await getCreateMetaFields(jira, jira.projectKey, "Story");
+      const storyMeta = await getCreateMetaFields(jira, jira.projectKey, "Story");
 
       const storyFields = {
         project: { key: jira.projectKey },
         summary: storySummary,
         issuetype: { name: "Story" },
         description: adf(storyDescription),
-        parent: { key: epicKey }, // team-managed link
+        parent: { key: epicKey },
       };
 
-      const missingStoryRequired = Object.entries(storyMetaFields)
-        .filter(([, def]) => def?.required)
-        .filter(([fieldId]) => storyFields[fieldId] === undefined)
-        .map(([fieldId, def]) => ({ fieldId, name: def?.name }));
+      if (storyMeta["reporter"]?.required) {
+        storyFields.reporter = { accountId: myAccountId };
+      }
 
-      if (missingStoryRequired.length > 0) {
+      const storyMissing = missingRequired(storyMeta, storyFields);
+      if (storyMissing.length > 0) {
         return res.status(400).json({
           ok: false,
           error: "Jira reports additional required fields for Story.",
           epic: epicCreate,
-          missingRequired: missingStoryRequired,
+          missingRequired: storyMissing,
         });
       }
 
