@@ -51,7 +51,14 @@ function mustEnv(name) {
   return v;
 }
 
+function safeStr(v, max = 120) {
+  const s = String(v ?? "");
+  if (s.length <= max) return s;
+  return s.slice(0, max) + "...";
+}
+
 function getProvidedOrkyKey(req) {
+  // Node/Next lowercases headers, but keep compatibility anyway
   const hdr =
     req.headers["x-orky-key"] ||
     req.headers["X-Orky-Key"] ||
@@ -165,7 +172,6 @@ function mergeExtraFields(baseFields, extraFields) {
     "issuetype",
     "description",
     "parent",
-    // Also protect these when we add them:
     "reporter",
   ]);
 
@@ -264,13 +270,35 @@ async function createStoryUnderEpic(jira, myAccountId, epicKey, input, { dryRun 
 }
 
 export default async function handler(req, res) {
+  // ===== ALWAYS LOG ENTRY (so we can prove the request reached Vercel) =====
+  try {
+    const hasXOrky = !!req.headers["x-orky-key"];
+    const hasAuth = !!req.headers["authorization"];
+    const provided = getProvidedOrkyKey(req);
+    console.log("[intake] hit", {
+      method: req.method,
+      url: req.url,
+      contentType: req.headers["content-type"],
+      hasXOrky,
+      hasAuth,
+      providedKeyLen: provided ? String(provided).length : 0,
+      bodyType: typeof req.body,
+      hasEpicsArray: Array.isArray(req.body?.epics),
+      hasEpicKey: !!req.body?.epicKey,
+      hasEpicSummary: !!req.body?.epicSummary,
+    });
+  } catch (e) {
+    // Logging should never kill the request
+    console.log("[intake] hit-log-failed", e?.message || e);
+  }
+
   try {
     if (req.method !== "POST") {
       res.setHeader("Allow", "POST");
       return res.status(405).json({ ok: false, error: "Use POST" });
     }
 
-    // 1) Orky auth (your own auth)
+    // 1) Orky auth
     assertOrkyAuth(req);
 
     // 2) Jira config
@@ -312,11 +340,9 @@ export default async function handler(req, res) {
           stories: [],
         };
 
-        // Count stories requested
         const storiesIn = Array.isArray(epicIn.stories) ? epicIn.stories : [];
         report.totals.storiesRequested += storiesIn.length;
 
-        // Create epic
         let epicKey = null;
         try {
           const createdEpic = await createEpic(jira, myAccountId, epicIn, { dryRun });
@@ -332,7 +358,6 @@ export default async function handler(req, res) {
           };
         }
 
-        // Create stories (only if epic created and we have a key; for dryRun, we still simulate with placeholder)
         for (let j = 0; j < storiesIn.length; j++) {
           const storyIn = storiesIn[j] || {};
           const storyItem = {
@@ -342,7 +367,6 @@ export default async function handler(req, res) {
             storyError: null,
           };
 
-          // If epic failed, mark story as failed but continue
           if (!epicKey && !dryRun) {
             report.totals.storiesFailed += 1;
             storyItem.storyError = {
@@ -376,7 +400,6 @@ export default async function handler(req, res) {
         report.epics.push(epicItem);
       }
 
-      // Always return 200 with a full success/failure report (as requested)
       return res.status(200).json(report);
     }
 
@@ -419,7 +442,7 @@ export default async function handler(req, res) {
       const storyIn = {
         storySummary: req.body?.storySummary || "Orky - First API Story",
         storyDescription: req.body?.storyDescription || "Created under the Epic (team-managed).",
-        fields: req.body?.fields_story, // optional separate bag if you want
+        fields: req.body?.fields_story,
       };
 
       storyCreate = await createStoryUnderEpic(jira, myAccountId, epicCreatedKey, storyIn, {
