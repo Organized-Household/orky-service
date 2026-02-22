@@ -2,11 +2,32 @@
 //
 // POST /api/intake
 //
-// Mode A (existing): create a new Epic (+ optional Story)
-//   Body: { epicSummary, ... }
+// Auth (required):
+//   Header: x-orky-key: <ORKY_API_KEY>   (recommended)
+//   OR
+//   Authorization: Bearer <ORKY_API_KEY>
 //
-// Mode B (new): create a Story under an existing Epic (team-managed)
-//   Body: { epicKey: "ORKY-6", storySummary: "..." }
+// Modes (auto-detected):
+// A) Single Epic create:
+//    Body: { epicSummary, epicDescription?, fields? }
+// B) Single Story create under existing Epic (team-managed):
+//    Body: { epicKey: "ORKY-6", storySummary, storyDescription?, fields? }
+// C) Batch create (Epics + Stories):
+//    Body: {
+//      epics: [
+//        {
+//          epicSummary,
+//          epicDescription?,
+//          fields?: { ... },
+//          stories?: [
+//            { storySummary, storyDescription?, fields?: { ... } },
+//            ...
+//          ]
+//        },
+//        ...
+//      ],
+//      options?: { dryRun?: boolean }
+//    }
 //
 // Required env vars:
 // - ORKY_API_KEY
@@ -16,7 +37,13 @@
 // - JIRA_PROJECT_KEY
 //
 // Optional env var:
-// - CREATE_STORY_UNDER_EPIC  "true" | "false" (for Mode A only)
+// - CREATE_STORY_UNDER_EPIC  "true" | "false" (Mode A only)
+//
+// Notes:
+// - Team-managed epic/story linkage uses `parent: { key: <EPIC_KEY> }` on Story.
+// - Batch continues on error per record and returns a success/failure report.
+// - `fields` lets you pass additional Jira fields (including customfield_XXXXX).
+//   Protected keys cannot be overridden.
 
 function mustEnv(name) {
   const v = process.env[name];
@@ -24,25 +51,35 @@ function mustEnv(name) {
   return v;
 }
 
+function getProvidedOrkyKey(req) {
+  const hdr =
+    req.headers["x-orky-key"] ||
+    req.headers["X-Orky-Key"] ||
+    req.headers["x-orky-Key"];
+
+  const auth = req.headers["authorization"] || req.headers["Authorization"];
+  if (auth && typeof auth === "string" && auth.toLowerCase().startsWith("bearer ")) {
+    return auth.slice(7).trim();
+  }
+  if (hdr && typeof hdr === "string") return hdr.trim();
+  return null;
+}
+
+function assertOrkyAuth(req) {
+  const expected = mustEnv("ORKY_API_KEY");
+  const provided = getProvidedOrkyKey(req);
+  if (!provided || provided !== expected) {
+    const err = new Error(
+      "Unauthorized. Missing required authorization (Authorization: Bearer <ORKY_API_KEY> or x-orky-key)."
+    );
+    err.statusCode = 401;
+    throw err;
+  }
+}
+
 function authHeader(email, token) {
   const basic = Buffer.from(`${email}:${token}`).toString("base64");
   return `Basic ${basic}`;
-}
-
-function requireOrkyAuth(req) {
-  const expected = mustEnv("ORKY_API_KEY");
-
-  // Accept either:
-  // 1) Authorization: Bearer <key>
-  // 2) x-orky-key: <key>
-  const auth = req.headers?.authorization || "";
-  const bearer = auth.toLowerCase().startsWith("bearer ") ? auth.slice(7).trim() : "";
-  const xKey = req.headers?.["x-orky-key"];
-
-  if (bearer === expected) return true;
-  if (xKey === expected) return true;
-
-  return false;
 }
 
 async function jiraFetch(jira, path, init = {}) {
@@ -66,6 +103,7 @@ async function jiraFetch(jira, path, init = {}) {
 
   if (!res.ok) {
     const err = new Error(`Jira error ${res.status}: ${res.statusText}`);
+    err.statusCode = res.status;
     err.details = json;
     throw err;
   }
@@ -76,7 +114,7 @@ function adf(text) {
   return {
     type: "doc",
     version: 1,
-    content: [{ type: "paragraph", content: [{ type: "text", text }] }],
+    content: [{ type: "paragraph", content: [{ type: "text", text: String(text || "") }] }],
   };
 }
 
@@ -115,6 +153,116 @@ function missingRequired(fieldsMeta, fieldsPayload) {
     .map(([fieldId, def]) => ({ fieldId, name: def?.name }));
 }
 
+/**
+ * Merge extra fields while preventing overrides of core/protected keys.
+ */
+function mergeExtraFields(baseFields, extraFields) {
+  if (!extraFields || typeof extraFields !== "object") return baseFields;
+
+  const protectedKeys = new Set([
+    "project",
+    "summary",
+    "issuetype",
+    "description",
+    "parent",
+    // Also protect these when we add them:
+    "reporter",
+  ]);
+
+  for (const [k, v] of Object.entries(extraFields)) {
+    if (protectedKeys.has(k)) continue;
+    baseFields[k] = v;
+  }
+  return baseFields;
+}
+
+async function createEpic(jira, myAccountId, input, { dryRun = false } = {}) {
+  const epicSummary = input?.epicSummary || "Orky - Epic";
+  const epicDescription = input?.epicDescription || "Created by Orky API.";
+  const extraFields = input?.fields;
+
+  const epicMeta = await getCreateMetaFields(jira, jira.projectKey, "Epic");
+
+  const epicFields = {
+    project: { key: jira.projectKey },
+    summary: epicSummary,
+    issuetype: { name: "Epic" },
+    description: adf(epicDescription),
+  };
+
+  const epicNameFieldId = findEpicNameFieldId(epicMeta);
+  if (epicNameFieldId && epicMeta[epicNameFieldId]?.required) {
+    epicFields[epicNameFieldId] = epicSummary;
+  }
+
+  if (epicMeta["reporter"]?.required) {
+    epicFields.reporter = { accountId: myAccountId };
+  }
+
+  mergeExtraFields(epicFields, extraFields);
+
+  const epicMissing = missingRequired(epicMeta, epicFields);
+  if (epicMissing.length > 0) {
+    const e = new Error("Jira reports additional required fields for Epic.");
+    e.statusCode = 400;
+    e.details = { missingRequired: epicMissing };
+    throw e;
+  }
+
+  if (dryRun) {
+    return { dryRun: true, fields: epicFields };
+  }
+
+  return jiraFetch(jira, "/rest/api/3/issue", {
+    method: "POST",
+    body: JSON.stringify({ fields: epicFields }),
+  });
+}
+
+async function createStoryUnderEpic(jira, myAccountId, epicKey, input, { dryRun = false } = {}) {
+  // Optional: validate epic exists
+  await jiraFetch(jira, `/rest/api/3/issue/${encodeURIComponent(epicKey)}?fields=key,issuetype`, {
+    method: "GET",
+  });
+
+  const storySummary = input?.storySummary || `Story under ${epicKey}`;
+  const storyDescription = input?.storyDescription || `Created by Orky API under Epic ${epicKey}.`;
+  const extraFields = input?.fields;
+
+  const storyMeta = await getCreateMetaFields(jira, jira.projectKey, "Story");
+
+  const storyFields = {
+    project: { key: jira.projectKey },
+    summary: storySummary,
+    issuetype: { name: "Story" },
+    description: adf(storyDescription),
+    parent: { key: epicKey }, // team-managed link
+  };
+
+  if (storyMeta["reporter"]?.required) {
+    storyFields.reporter = { accountId: myAccountId };
+  }
+
+  mergeExtraFields(storyFields, extraFields);
+
+  const missing = missingRequired(storyMeta, storyFields);
+  if (missing.length > 0) {
+    const e = new Error("Jira reports additional required fields for Story.");
+    e.statusCode = 400;
+    e.details = { missingRequired: missing };
+    throw e;
+  }
+
+  if (dryRun) {
+    return { dryRun: true, fields: storyFields };
+  }
+
+  return jiraFetch(jira, "/rest/api/3/issue", {
+    method: "POST",
+    body: JSON.stringify({ fields: storyFields }),
+  });
+}
+
 export default async function handler(req, res) {
   try {
     if (req.method !== "POST") {
@@ -122,14 +270,10 @@ export default async function handler(req, res) {
       return res.status(405).json({ ok: false, error: "Use POST" });
     }
 
-    // ✅ Orky API authentication happens HERE (before any Jira calls)
-    if (!requireOrkyAuth(req)) {
-      return res.status(401).json({
-        ok: false,
-        error: "Unauthorized. Provide Authorization: Bearer <ORKY_API_KEY> or x-orky-key.",
-      });
-    }
+    // 1) Orky auth (your own auth)
+    assertOrkyAuth(req);
 
+    // 2) Jira config
     const jira = {
       baseUrl: mustEnv("JIRA_BASE_URL"),
       email: mustEnv("JIRA_EMAIL"),
@@ -139,45 +283,114 @@ export default async function handler(req, res) {
 
     const myAccountId = await getMyAccountId(jira);
 
+    // ===== MODE C: Batch =====
+    if (Array.isArray(req.body?.epics)) {
+      const dryRun = !!req.body?.options?.dryRun;
+
+      const report = {
+        ok: true,
+        mode: "batch",
+        dryRun,
+        totals: {
+          epicsRequested: req.body.epics.length,
+          epicsCreated: 0,
+          epicsFailed: 0,
+          storiesRequested: 0,
+          storiesCreated: 0,
+          storiesFailed: 0,
+        },
+        epics: [],
+      };
+
+      for (let i = 0; i < req.body.epics.length; i++) {
+        const epicIn = req.body.epics[i] || {};
+        const epicItem = {
+          index: i,
+          epicSummary: epicIn.epicSummary || null,
+          epic: null,
+          epicError: null,
+          stories: [],
+        };
+
+        // Count stories requested
+        const storiesIn = Array.isArray(epicIn.stories) ? epicIn.stories : [];
+        report.totals.storiesRequested += storiesIn.length;
+
+        // Create epic
+        let epicKey = null;
+        try {
+          const createdEpic = await createEpic(jira, myAccountId, epicIn, { dryRun });
+          epicItem.epic = createdEpic;
+          epicKey = createdEpic?.key || null;
+          report.totals.epicsCreated += 1;
+        } catch (e) {
+          report.totals.epicsFailed += 1;
+          epicItem.epicError = {
+            message: e?.message || "Epic create failed",
+            statusCode: e?.statusCode || 500,
+            details: e?.details || null,
+          };
+        }
+
+        // Create stories (only if epic created and we have a key; for dryRun, we still simulate with placeholder)
+        for (let j = 0; j < storiesIn.length; j++) {
+          const storyIn = storiesIn[j] || {};
+          const storyItem = {
+            index: j,
+            storySummary: storyIn.storySummary || null,
+            story: null,
+            storyError: null,
+          };
+
+          // If epic failed, mark story as failed but continue
+          if (!epicKey && !dryRun) {
+            report.totals.storiesFailed += 1;
+            storyItem.storyError = {
+              message: "Skipped because Epic was not created.",
+              statusCode: 424,
+              details: null,
+            };
+            epicItem.stories.push(storyItem);
+            continue;
+          }
+
+          try {
+            const keyToUse = dryRun ? (epicIn.epicKey || "DRYRUN-EPIC") : epicKey;
+            const createdStory = await createStoryUnderEpic(jira, myAccountId, keyToUse, storyIn, {
+              dryRun,
+            });
+            storyItem.story = createdStory;
+            report.totals.storiesCreated += 1;
+          } catch (e) {
+            report.totals.storiesFailed += 1;
+            storyItem.storyError = {
+              message: e?.message || "Story create failed",
+              statusCode: e?.statusCode || 500,
+              details: e?.details || null,
+            };
+          }
+
+          epicItem.stories.push(storyItem);
+        }
+
+        report.epics.push(epicItem);
+      }
+
+      // Always return 200 with a full success/failure report (as requested)
+      return res.status(200).json(report);
+    }
+
     // ===== MODE B: Create Story under existing Epic =====
     const epicKey = req.body?.epicKey;
     if (epicKey) {
-      // Validate epic exists (optional but nice)
-      await jiraFetch(
-        jira,
-        `/rest/api/3/issue/${encodeURIComponent(epicKey)}?fields=key,issuetype`,
-        { method: "GET" }
-      );
-
-      const storySummary = req.body?.storySummary || `Story under ${epicKey}`;
-      const storyDescription = req.body?.storyDescription || `Created by Orky API under Epic ${epicKey}.`;
-
-      const storyMeta = await getCreateMetaFields(jira, jira.projectKey, "Story");
-
-      const storyFields = {
-        project: { key: jira.projectKey },
-        summary: storySummary,
-        issuetype: { name: "Story" },
-        description: adf(storyDescription),
-        parent: { key: epicKey }, // team-managed link
+      const storyIn = {
+        storySummary: req.body?.storySummary,
+        storyDescription: req.body?.storyDescription,
+        fields: req.body?.fields,
       };
 
-      if (storyMeta["reporter"]?.required) {
-        storyFields.reporter = { accountId: myAccountId };
-      }
-
-      const missing = missingRequired(storyMeta, storyFields);
-      if (missing.length > 0) {
-        return res.status(400).json({
-          ok: false,
-          error: "Jira reports additional required fields for Story.",
-          missingRequired: missing,
-        });
-      }
-
-      const created = await jiraFetch(jira, "/rest/api/3/issue", {
-        method: "POST",
-        body: JSON.stringify({ fields: storyFields }),
+      const created = await createStoryUnderEpic(jira, myAccountId, epicKey, storyIn, {
+        dryRun: false,
       });
 
       return res.status(200).json({
@@ -188,77 +401,29 @@ export default async function handler(req, res) {
       });
     }
 
-    // ===== MODE A: Create Epic (existing behavior) =====
+    // ===== MODE A: Create Epic (optionally create story under it) =====
     const CREATE_STORY_UNDER_EPIC =
       (process.env.CREATE_STORY_UNDER_EPIC || "false").toLowerCase() === "true";
 
-    const epicSummary = req.body?.epicSummary || "Orky - First API Epic";
-    const epicDescription =
-      req.body?.epicDescription || "Created by Orky via Vercel API (no DB logging yet).";
-
-    const epicMeta = await getCreateMetaFields(jira, jira.projectKey, "Epic");
-
-    const epicFields = {
-      project: { key: jira.projectKey },
-      summary: epicSummary,
-      issuetype: { name: "Epic" },
-      description: adf(epicDescription),
+    const epicIn = {
+      epicSummary: req.body?.epicSummary || "Orky - First API Epic",
+      epicDescription: req.body?.epicDescription || "Created by Orky via API.",
+      fields: req.body?.fields,
     };
 
-    const epicNameFieldId = findEpicNameFieldId(epicMeta);
-    if (epicNameFieldId && epicMeta[epicNameFieldId]?.required) {
-      epicFields[epicNameFieldId] = epicSummary;
-    }
-
-    if (epicMeta["reporter"]?.required) {
-      epicFields.reporter = { accountId: myAccountId };
-    }
-
-    const epicMissing = missingRequired(epicMeta, epicFields);
-    if (epicMissing.length > 0) {
-      return res.status(400).json({
-        ok: false,
-        error: "Jira reports additional required fields for Epic.",
-        missingRequired: epicMissing,
-      });
-    }
-
-    const epicCreate = await jiraFetch(jira, "/rest/api/3/issue", {
-      method: "POST",
-      body: JSON.stringify({ fields: epicFields }),
-    });
-
+    const epicCreate = await createEpic(jira, myAccountId, epicIn, { dryRun: false });
     const epicCreatedKey = epicCreate?.key;
 
     let storyCreate = null;
     if (CREATE_STORY_UNDER_EPIC) {
-      const storyMeta = await getCreateMetaFields(jira, jira.projectKey, "Story");
-
-      const storyFields = {
-        project: { key: jira.projectKey },
-        summary: req.body?.storySummary || "Orky - First API Story",
-        issuetype: { name: "Story" },
-        description: adf(req.body?.storyDescription || "Created under the Epic (team-managed)."),
-        parent: { key: epicCreatedKey },
+      const storyIn = {
+        storySummary: req.body?.storySummary || "Orky - First API Story",
+        storyDescription: req.body?.storyDescription || "Created under the Epic (team-managed).",
+        fields: req.body?.fields_story, // optional separate bag if you want
       };
 
-      if (storyMeta["reporter"]?.required) {
-        storyFields.reporter = { accountId: myAccountId };
-      }
-
-      const storyMissing = missingRequired(storyMeta, storyFields);
-      if (storyMissing.length > 0) {
-        return res.status(400).json({
-          ok: false,
-          error: "Jira reports additional required fields for Story.",
-          epic: epicCreate,
-          missingRequired: storyMissing,
-        });
-      }
-
-      storyCreate = await jiraFetch(jira, "/rest/api/3/issue", {
-        method: "POST",
-        body: JSON.stringify({ fields: storyFields }),
+      storyCreate = await createStoryUnderEpic(jira, myAccountId, epicCreatedKey, storyIn, {
+        dryRun: false,
       });
     }
 
@@ -270,8 +435,9 @@ export default async function handler(req, res) {
       createdStory: CREATE_STORY_UNDER_EPIC,
     });
   } catch (e) {
+    const status = e?.statusCode || 500;
     console.error("[intake] error:", e?.message, e?.details || e);
-    return res.status(500).json({
+    return res.status(status).json({
       ok: false,
       error: e?.message || "Unknown error",
       jiraDetails: e?.details || null,
