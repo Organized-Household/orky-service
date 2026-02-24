@@ -1,5 +1,6 @@
-// pages/api/github/pr.js
-import { SignJWT, importPKCS8 } from "jose";
+// api/github/pr.js
+import { Octokit } from "octokit";
+import { createAppAuth } from "@octokit/auth-app";
 
 function mustGetEnv(name) {
   const v = process.env[name];
@@ -8,279 +9,147 @@ function mustGetEnv(name) {
 }
 
 function normalizePem(pem) {
-  // Vercel env vars sometimes store newlines as "\n"
-  if (pem.includes("\\n")) return pem.replace(/\\n/g, "\n");
-  return pem;
+  // If stored as single line with literal \n in Vercel env
+  return pem.includes("\\n") ? pem.replace(/\\n/g, "\n") : pem;
 }
 
-async function createAppJwt() {
+async function getOctokitAsInstallation() {
   const appId = mustGetEnv("GH_APP_ID");
-  const pem = normalizePem(mustGetEnv("GH_APP_PRIVATE_KEY"));
-
-  // GitHub App keys are RSA (PKCS8). Some downloads are PKCS1 ("BEGIN RSA PRIVATE KEY").
-  // If your file begins with "BEGIN RSA PRIVATE KEY", convert it to PKCS8, or re-download if GitHub provided PKCS8.
-  // Many GitHub App keys today are PKCS8 ("BEGIN PRIVATE KEY").
-  const pkcs8 = pem;
-
-  const key = await importPKCS8(pkcs8, "RS256");
-
-  const now = Math.floor(Date.now() / 1000);
-  const jwt = await new SignJWT({})
-    .setProtectedHeader({ alg: "RS256" })
-    .setIssuedAt(now - 10)
-    .setExpirationTime(now + 9 * 60) // max 10 minutes; keep under
-    .setIssuer(appId)
-    .sign(key);
-
-  return jwt;
-}
-
-async function getInstallationToken() {
   const installationId = mustGetEnv("GH_APP_INSTALLATION_ID");
-  const jwt = await createAppJwt();
+  const privateKey = normalizePem(mustGetEnv("GH_APP_PRIVATE_KEY"));
 
-  const res = await fetch(
-    `https://api.github.com/app/installations/${installationId}/access_tokens`,
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${jwt}`,
-        Accept: "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-      },
-    }
-  );
-
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Failed to get installation token: ${res.status} ${text}`);
-  }
-  const data = await res.json();
-  return data.token;
-}
-
-async function ghFetch(token, url, options = {}) {
-  const res = await fetch(url, {
-    ...options,
-    headers: {
-      Authorization: `token ${token}`,
-      Accept: "application/vnd.github+json",
-      "X-GitHub-Api-Version": "2022-11-28",
-      ...(options.headers || {}),
-    },
+  const auth = createAppAuth({
+    appId,
+    privateKey, // works with "-----BEGIN RSA PRIVATE KEY-----"
+    installationId,
   });
 
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`GitHub API error ${res.status}: ${url}\n${text}`);
-  }
-  return res.json();
-}
-
-async function getBranchSha({ token, owner, repo, branch }) {
-  const ref = await ghFetch(
-    token,
-    `https://api.github.com/repos/${owner}/${repo}/git/ref/heads/${branch}`
-  );
-  return ref.object.sha;
-}
-
-async function createBranch({ token, owner, repo, newBranch, fromSha }) {
-  return ghFetch(token, `https://api.github.com/repos/${owner}/${repo}/git/refs`, {
-    method: "POST",
-    body: JSON.stringify({
-      ref: `refs/heads/${newBranch}`,
-      sha: fromSha,
-    }),
-  });
-}
-
-// Commit multiple files by creating blobs + tree + commit + moving the ref.
-// This avoids one-commit-per-file.
-async function commitFiles({
-  token,
-  owner,
-  repo,
-  branch,
-  commitMessage,
-  files, // [{ path, content, encoding? ("utf-8" default), mode? }]
-}) {
-  // 1) Get latest commit on branch (ref -> commit -> tree)
-  const ref = await ghFetch(
-    token,
-    `https://api.github.com/repos/${owner}/${repo}/git/ref/heads/${branch}`
-  );
-  const commitSha = ref.object.sha;
-
-  const commit = await ghFetch(
-    token,
-    `https://api.github.com/repos/${owner}/${repo}/git/commits/${commitSha}`
-  );
-  const baseTreeSha = commit.tree.sha;
-
-  // 2) Create blobs for each file
-  const treeItems = [];
-  for (const f of files) {
-    if (!f.path || typeof f.content !== "string") {
-      throw new Error("Each file must include { path, content }");
-    }
-    const blob = await ghFetch(
-      token,
-      `https://api.github.com/repos/${owner}/${repo}/git/blobs`,
-      {
-        method: "POST",
-        body: JSON.stringify({
-          content: f.content,
-          encoding: f.encoding || "utf-8",
-        }),
-      }
-    );
-
-    treeItems.push({
-      path: f.path,
-      mode: f.mode || "100644",
-      type: "blob",
-      sha: blob.sha,
-    });
-  }
-
-  // 3) Create a new tree
-  const newTree = await ghFetch(
-    token,
-    `https://api.github.com/repos/${owner}/${repo}/git/trees`,
-    {
-      method: "POST",
-      body: JSON.stringify({
-        base_tree: baseTreeSha,
-        tree: treeItems,
-      }),
-    }
-  );
-
-  // 4) Create commit
-  const newCommit = await ghFetch(
-    token,
-    `https://api.github.com/repos/${owner}/${repo}/git/commits`,
-    {
-      method: "POST",
-      body: JSON.stringify({
-        message: commitMessage,
-        tree: newTree.sha,
-        parents: [commitSha],
-      }),
-    }
-  );
-
-  // 5) Update the branch ref to point to new commit
-  await ghFetch(
-    token,
-    `https://api.github.com/repos/${owner}/${repo}/git/refs/heads/${branch}`,
-    {
-      method: "PATCH",
-      body: JSON.stringify({
-        sha: newCommit.sha,
-        force: false,
-      }),
-    }
-  );
-
-  return newCommit.sha;
-}
-
-async function openPullRequest({ token, owner, repo, head, base, title, body }) {
-  return ghFetch(token, `https://api.github.com/repos/${owner}/${repo}/pulls`, {
-    method: "POST",
-    body: JSON.stringify({
-      title,
-      head, // branch name (or "owner:branch")
-      base, // target branch
-      body: body || "",
-      draft: false,
-    }),
-  });
+  const { token } = await auth({ type: "installation" });
+  return new Octokit({ auth: token });
 }
 
 export default async function handler(req, res) {
   try {
-    // Basic auth for your endpoint
+    // Auth your endpoint (same idea as your Jira endpoint)
     const expected = mustGetEnv("ORKY_API_KEY");
     const headerKey = req.headers["x-orky-key"];
     const bearer = (req.headers.authorization || "").replace("Bearer ", "");
     const provided = headerKey || bearer;
 
     if (!provided || provided !== expected) {
-      return res.status(401).json({ error: "Unauthorized" });
+      return res.status(401).json({ ok: false, error: "Unauthorized" });
     }
-
     if (req.method !== "POST") {
-      return res.status(405).json({ error: "Use POST" });
+      return res.status(405).json({ ok: false, error: "Use POST" });
     }
 
     const owner = mustGetEnv("GH_OWNER");
-    const defaultBranch = mustGetEnv("GH_DEFAULT_BRANCH");
+    const base = mustGetEnv("GH_DEFAULT_BRANCH");
 
     const {
-      repo, // e.g. "ohh-web" (required)
-      branchName, // optional; will auto-generate if omitted
-      prTitle,
-      prBody,
-      commitMessage,
-      files, // [{ path, content }]
+      repo,               // required: "ohh-web"
+      branchName,         // optional
+      prTitle,            // optional
+      prBody,             // optional
+      commitMessage,      // optional
+      files,              // required: [{ path, content }]
     } = req.body || {};
 
-    if (!repo) return res.status(400).json({ error: "Missing body.repo" });
-    if (!Array.isArray(files) || files.length === 0)
-      return res.status(400).json({ error: "Missing body.files[]" });
+    if (!repo) return res.status(400).json({ ok: false, error: "Missing body.repo" });
+    if (!Array.isArray(files) || files.length === 0) {
+      return res.status(400).json({ ok: false, error: "Missing body.files[]" });
+    }
 
-    const token = await getInstallationToken();
+    const octokit = await getOctokitAsInstallation();
 
-    // 1) base SHA
-    const baseSha = await getBranchSha({
-      token,
+    const head =
+      branchName || `orky/${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+
+    // 1) Base SHA (default branch)
+    const baseRef = await octokit.request("GET /repos/{owner}/{repo}/git/ref/{ref}", {
       owner,
       repo,
-      branch: defaultBranch,
+      ref: `heads/${base}`,
+    });
+    const baseSha = baseRef.data.object.sha;
+
+    // 2) Create branch
+    await octokit.request("POST /repos/{owner}/{repo}/git/refs", {
+      owner,
+      repo,
+      ref: `refs/heads/${head}`,
+      sha: baseSha,
     });
 
-    // 2) create new branch
-    const safeBranch =
-      branchName ||
-      `orky/${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+    // 3) Build a single commit with multiple files
+    const commit0 = await octokit.request(
+      "GET /repos/{owner}/{repo}/git/commits/{commit_sha}",
+      { owner, repo, commit_sha: baseSha }
+    );
+    const baseTreeSha = commit0.data.tree.sha;
 
-    await createBranch({ token, owner, repo, newBranch: safeBranch, fromSha: baseSha });
+    const tree = [];
+    for (const f of files) {
+      if (!f?.path || typeof f?.content !== "string") {
+        return res.status(400).json({
+          ok: false,
+          error: "Each file must include { path, content }",
+        });
+      }
+      const blob = await octokit.request("POST /repos/{owner}/{repo}/git/blobs", {
+        owner,
+        repo,
+        content: f.content,
+        encoding: "utf-8",
+      });
+      tree.push({ path: f.path, mode: "100644", type: "blob", sha: blob.data.sha });
+    }
 
-    // 3) commit files
-    const finalCommitMessage = commitMessage || `Orky update (${safeBranch})`;
-    await commitFiles({
-      token,
+    const newTree = await octokit.request("POST /repos/{owner}/{repo}/git/trees", {
       owner,
       repo,
-      branch: safeBranch,
-      commitMessage: finalCommitMessage,
-      files,
+      base_tree: baseTreeSha,
+      tree,
     });
 
-    // 4) open PR
-    const pr = await openPullRequest({
-      token,
+    const msg = commitMessage || `Orky update (${head})`;
+    const newCommit = await octokit.request("POST /repos/{owner}/{repo}/git/commits", {
       owner,
       repo,
-      head: safeBranch,
-      base: defaultBranch,
-      title: prTitle || `Orky PR: ${finalCommitMessage}`,
+      message: msg,
+      tree: newTree.data.sha,
+      parents: [baseSha],
+    });
+
+    await octokit.request("PATCH /repos/{owner}/{repo}/git/refs/{ref}", {
+      owner,
+      repo,
+      ref: `heads/${head}`,
+      sha: newCommit.data.sha,
+      force: false,
+    });
+
+    // 4) Open PR
+    const pr = await octokit.request("POST /repos/{owner}/{repo}/pulls", {
+      owner,
+      repo,
+      title: prTitle || `Orky PR: ${msg}`,
+      head,
+      base,
       body: prBody || "",
+      draft: false,
     });
 
     return res.status(200).json({
       ok: true,
       owner,
       repo,
-      base: defaultBranch,
-      head: safeBranch,
-      prUrl: pr.html_url,
-      prNumber: pr.number,
+      base,
+      head,
+      prUrl: pr.data.html_url,
+      prNumber: pr.data.number,
     });
   } catch (err) {
-    return res.status(500).json({ error: err?.message || String(err) });
+    return res.status(500).json({ ok: false, error: err?.message || String(err) });
   }
 }
