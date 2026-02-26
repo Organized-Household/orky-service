@@ -85,7 +85,7 @@ Return ONLY a JSON object with this structure:
     "prTitle": "string",
     "prBody": "string",
     "commitMessage": "string",
-    "branchName": "string (optional)",
+    "branchName": "string",
     "files": [
       { "path": "string", "content": "string" }
     ]
@@ -98,6 +98,7 @@ Return ONLY a JSON object with this structure:
   }
 }
 
+branchName must always be present. Use an empty string "" to request auto-generated branch naming.
 Do not include any fields outside this schema.
 
 ---
