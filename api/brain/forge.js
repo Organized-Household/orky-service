@@ -58,7 +58,7 @@ const FORGE_OUTPUT_SCHEMA = {
       payload: {
         type: "object",
         additionalProperties: false,
-        required: ["repo", "prTitle", "prBody", "commitMessage", "files"],
+        required: ["repo", "prTitle", "prBody", "commitMessage", "branchName", "files"],
         properties: {
           repo: { type: "string" },
           prTitle: { type: "string" },
