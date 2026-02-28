@@ -63,4 +63,4 @@ async function jiraSearchReadyIssues() {
   const baseUrl = mustGetEnv("JIRA_BASE_URL").replace(/\/+$/, "");
   const email = mustGetEnv("JIRA_EMAIL");
   const token = mustGetEnv("JIRA_API_TOKEN");
- 
+} 
