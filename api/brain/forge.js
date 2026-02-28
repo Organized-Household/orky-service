@@ -5,18 +5,6 @@ import OpenAI from "openai";
 /**
  * POST /api/brain/forge
  *
- * Auth (required):
- *   Header: x-orky-key: <ORKY_API_KEY>   (recommended)
- *   OR
- *   Authorization: Bearer <ORKY_API_KEY>
- *
- * Body:
- * {
- *   "instruction": "What you want Forge to build",
- *   "contextSources": [{...}], // optional
- *   "repo": "orky-service"     // optional (used in output payload)
- * }
- *
  * Returns:
  * { ok: true, proposal: <Forge strict JSON> }
  */
@@ -40,7 +28,7 @@ function getProvidedKey(req) {
 }
 
 async function loadForgePromptPack() {
-  // Put the prompt pack at repo root: /agents/forge.md
+  // Prompt pack at repo root: /agents/forge.md
   const filePath = path.join(process.cwd(), "agents", "forge.md");
   return fs.readFile(filePath, "utf8");
 }
@@ -74,11 +62,11 @@ const FORGE_OUTPUT_SCHEMA = {
               required: ["path", "content"],
               properties: {
                 path: { type: "string" },
-                content: { type: "string" }
-              }
-            }
-          }
-        }
+                content: { type: "string" },
+              },
+            },
+          },
+        },
       },
       quality: {
         type: "object",
@@ -88,93 +76,96 @@ const FORGE_OUTPUT_SCHEMA = {
           assumptions: { type: "array", items: { type: "string" } },
           risks: { type: "array", items: { type: "string" } },
           testPlan: { type: "array", items: { type: "string" } },
-          rollbackPlan: { type: "array", items: { type: "string" } }
-        }
-      }
-    }
-  }
+          rollbackPlan: { type: "array", items: { type: "string" } },
+        },
+      },
+    },
+  },
 };
 
+/**
+ * Named export for internal orchestration (jira_scanner).
+ * This is the function your scanner should call.
+ */
+export async function forgeProposal({ instruction, contextSources, repo }) {
+  if (!instruction || typeof instruction !== "string") {
+    throw new Error("forgeProposal: instruction (string) is required");
+  }
+
+  const forgePack = await loadForgePromptPack();
+
+  const userPayload = {
+    instruction,
+    repo: repo || "orky-service",
+    contextSources: Array.isArray(contextSources) ? contextSources : [],
+  };
+
+  const client = new OpenAI({ apiKey: mustGetEnv("OPENAI_API_KEY") });
+  const model = process.env.OPENAI_MODEL || "gpt-5-mini";
+
+  const response = await client.responses.create({
+    model,
+    instructions: forgePack,
+    input: [
+      {
+        role: "user",
+        content: [
+          {
+            type: "input_text",
+            text:
+              "Generate a GitHub PR proposal as strict JSON per the schema. " +
+              "Use the provided instruction and context. Return JSON only.\n\n" +
+              JSON.stringify(userPayload, null, 2),
+          },
+        ],
+      },
+    ],
+    text: {
+      format: {
+        type: "json_schema",
+        ...FORGE_OUTPUT_SCHEMA,
+      },
+    },
+  });
+
+  const raw = response.output_text?.trim();
+  if (!raw) {
+    throw new Error(`OpenAI response missing output_text (response_id=${response.id})`);
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(`OpenAI returned non-JSON output (response_id=${response.id})`);
+  }
+
+  return parsed; // <-- returns proposal object directly
+}
+
+/**
+ * Default API route handler remains intact.
+ * Calls forgeProposal() and wraps with { ok: true, proposal }.
+ */
 export default async function handler(req, res) {
   try {
-    // --- Auth
     const expected = mustGetEnv("ORKY_API_KEY");
     const provided = getProvidedKey(req);
     if (!provided || provided !== expected) {
       return res.status(401).json({ ok: false, error: "Unauthorized" });
     }
 
-    // --- Method
     if (req.method !== "POST") {
       return res.status(405).json({ ok: false, error: "Use POST" });
     }
 
-    // --- Body
     const { instruction, contextSources, repo } = req.body || {};
     if (!instruction || typeof instruction !== "string") {
       return res.status(400).json({ ok: false, error: "Missing body.instruction (string)" });
     }
 
-    const forgePack = await loadForgePromptPack();
-
-    const userPayload = {
-      instruction,
-      repo: repo || "orky-service",
-      contextSources: Array.isArray(contextSources) ? contextSources : []
-    };
-
-    const client = new OpenAI({ apiKey: mustGetEnv("OPENAI_API_KEY") });
-    const model = process.env.OPENAI_MODEL || "gpt-5-mini";
-
-    // Responses API with Structured Outputs (JSON Schema)
-    const response = await client.responses.create({
-      model,
-      instructions: forgePack,
-      input: [
-        {
-          role: "user",
-          content: [
-            {
-              // IMPORTANT: Responses API expects input_text, not text
-              type: "input_text",
-              text:
-                "Generate a GitHub PR proposal as strict JSON per the schema. " +
-                "Use the provided instruction and context. Return JSON only.\n\n" +
-                JSON.stringify(userPayload, null, 2)
-            }
-          ]
-        }
-      ],
-      text: {
-        format: {
-          type: "json_schema",
-          ...FORGE_OUTPUT_SCHEMA
-        }
-      }
-    });
-
-    const raw = response.output_text?.trim();
-    if (!raw) {
-      return res.status(500).json({
-        ok: false,
-        error: "OpenAI response missing output_text",
-        debug: { response_id: response.id }
-      });
-    }
-
-    let parsed;
-    try {
-      parsed = JSON.parse(raw);
-    } catch {
-      return res.status(500).json({
-        ok: false,
-        error: "OpenAI returned non-JSON output (unexpected)",
-        raw,
-        debug: { response_id: response.id }
-      });
-    }
-
-    return res.status(200).json({ ok: true, proposal: parsed });
+    const proposal = await forgeProposal({ instruction, contextSources, repo });
+    return res.status(200).json({ ok: true, proposal });
   } catch (err) {
     return res.status(500).json({ ok: false, error: err?.message || String(err) });
   }
