@@ -17,8 +17,8 @@ import crypto from "crypto";
 
 // --- External modules you said are working ---
 import { forgeProposal } from "./forge.js";
-import { brainToHandsCreatePr } from "./forge_to_pr.js";
-
+//import { brainToHandsCreatePr } from "./forge_to_pr.js";
+import { handler } from "./forge_to_pr.js";
 // ------------------- Config -------------------
 
 const STATUS_READY = "Ready for Engineering";
