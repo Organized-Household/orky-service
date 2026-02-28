@@ -1,24 +1,17 @@
 // api/brain/jira_scanner.js
 //
-// Orky Jira Scanner + Orchestrator
-// Trigger model (recommended):
-// - Jira Automation calls this endpoint when an issue transitions to "Ready for Engineering"
-// - Body includes { jiraKey: "ORKY-123" } so we process only that ticket
+// Triggered by Jira Automation "Issue transitioned" -> To: Ready for Engineering
+// Jira sends POST with body: { "jiraKey": "ORKY-123" }
 //
 // Behavior:
-// - Validate required info (hard rules)
-// - If validation fails: transition Ready for Engineering -> In Review and comment reason
-// - If validation passes: transition Ready for Engineering -> In Progress
-// - Forge proposal -> create PR in ohh-web -> transition to In Review with PR URL
-//
-// Human-readable IDs only: Jira key + timestamp.
+// - Validate required fields
+// - If validation fails: Ready -> In Review with comment
+// - Else: Ready -> In Progress, forge proposal, create PR in ohh-web, then In Review
 
 import crypto from "crypto";
-
-// --- External modules you said are working ---
 import { forgeProposal } from "./forge.js";
-//import { brainToHandsCreatePr } from "./forge_to_pr.js";
-import { handler } from "./forge_to_pr.js";
+import { brainToHandsCreatePr } from "./forge_to_pr.js";
+
 // ------------------- Config -------------------
 
 const STATUS_READY = "Ready for Engineering";
@@ -31,7 +24,8 @@ const JIRA_API_TOKEN = process.env.JIRA_API_TOKEN;
 const JIRA_PROJECT_KEY = process.env.JIRA_PROJECT_KEY;
 
 const JIRA_AC_FIELD_ID = process.env.JIRA_ACCEPTANCE_CRITERIA_FIELD_ID || "";
-const DEFAULT_TARGET_REPO = process.env.DEFAULT_TARGET_REPO || "";
+const DEFAULT_TARGET_REPO = process.env.DEFAULT_TARGET_REPO || "ohh-web";
+
 const TRANSITION_ID_TO_IN_PROGRESS = process.env.JIRA_TRANSITION_ID_TO_IN_PROGRESS || "";
 const TRANSITION_ID_TO_IN_REVIEW = process.env.JIRA_TRANSITION_ID_TO_IN_REVIEW || "";
 
@@ -46,6 +40,12 @@ const REQUIRE_AUTOMATION_ALLOWED_LABEL = false;
 const AUTOMATION_ALLOWED_LABEL = "automation:allowed";
 
 // ------------------- Utilities -------------------
+
+function mustGetEnv(name) {
+  const v = process.env[name];
+  if (!v) throw new Error(`Missing env var: ${name}`);
+  return v;
+}
 
 function humanTimestamp() {
   const d = new Date();
@@ -127,7 +127,6 @@ async function jiraGetIssue(jiraKey) {
 
 async function jiraSearchReadyIssues() {
   if (!JIRA_PROJECT_KEY) throw new Error("Missing JIRA_PROJECT_KEY");
-
   const jql = `project = "${JIRA_PROJECT_KEY}" AND status = "${STATUS_READY}" ORDER BY updated DESC`;
 
   const fields = [
@@ -145,7 +144,8 @@ async function jiraSearchReadyIssues() {
     fields: fields.join(","),
   });
 
-  return jiraFetch(`/rest/api/3/search?${params.toString()}`);
+  const resp = await jiraFetch(`/rest/api/3/search?${params.toString()}`);
+  return resp.issues || [];
 }
 
 function extractDescriptionText(fields) {
@@ -153,6 +153,7 @@ function extractDescriptionText(fields) {
   if (!desc) return "";
   if (typeof desc === "string") return desc;
 
+  // Atlassian Document Format (ADF) naive extraction
   if (typeof desc === "object") {
     try {
       const chunks = [];
@@ -167,7 +168,6 @@ function extractDescriptionText(fields) {
       return "";
     }
   }
-
   return "";
 }
 
@@ -209,7 +209,7 @@ async function jiraTransition(jiraKey, transitionId) {
 
 function validateHardRules(issue) {
   const fields = issue.fields || {};
-  const jiraKey = issue.key || issue.id || "UNKNOWN";
+  const jiraKey = issue.key;
 
   const statusName = fields.status?.name || "";
   const summary = normalizeText(fields.summary);
@@ -236,13 +236,13 @@ function validateHardRules(issue) {
   }
 
   const targetRepo = DEFAULT_TARGET_REPO;
-  if (!targetRepo) blockers.push("Missing target repo (set DEFAULT_TARGET_REPO or map from Jira field)");
+  if (!targetRepo) blockers.push("Missing target repo (DEFAULT_TARGET_REPO)");
 
   return {
     ok: blockers.length === 0,
     blockers,
     extracted: {
-      jiraKey: issue.key,
+      jiraKey,
       jiraStatus: statusName,
       jiraUpdatedAt,
       summary,
@@ -258,15 +258,13 @@ function validateHardRules(issue) {
 
 export async function runJiraScanner({ jiraKey } = {}) {
   const runTs = humanTimestamp();
+  const expectedKey = mustGetEnv("ORKY_API_KEY");
 
-  // If Jira Automation passes jiraKey, process only that issue.
   const issues = [];
   if (jiraKey) {
-    const issue = await jiraGetIssue(jiraKey);
-    issues.push(issue);
+    issues.push(await jiraGetIssue(jiraKey));
   } else {
-    const scan = await jiraSearchReadyIssues();
-    issues.push(...(scan.issues || []));
+    issues.push(...(await jiraSearchReadyIssues()));
   }
 
   const results = {
@@ -322,31 +320,48 @@ export async function runJiraScanner({ jiraKey } = {}) {
 
       const proposal = await forgeProposal(forgeInput);
 
+      // Expect forgeProposal to either return a proposal object,
+      // or { ok, proposal }. Normalize.
+      const normalizedProposal =
+        proposal?.proposal ? proposal.proposal : proposal;
+
+      // If forge returns a github_pr proposal, extract payload. Otherwise, fail clearly.
+      if (!normalizedProposal || normalizedProposal.kind !== "github_pr" || !normalizedProposal.payload) {
+        throw new Error("forgeProposal did not return a github_pr proposal with payload");
+      }
+
+      const payload = normalizedProposal.payload;
+
+      // Create PR in ohh-web
       const pr = await brainToHandsCreatePr({
-        jiraKey: key,
+        baseUrl: process.env.PUBLIC_BASE_URL || undefined, // optional; handler will use req host, but here we call function, so pass explicitly below
+        apiKey: expectedKey,
+        // We'll build baseUrl here (PUBLIC_BASE_URL required for server-to-server call)
+        baseUrl: mustGetEnv("PUBLIC_BASE_URL"),
         repo: targetRepo,
-        timestamp: runTs,
-        branchName: `${key}/${runTs}`,
-        prTitle: `${key}: ${summary}`,
+        branchName: payload.branchName || `${key}/${runTs}`,
+        prTitle: payload.prTitle || `${key}: ${summary}`,
+        prBody:
+          (payload.prBody || "") +
+          `\n\nJira: ${key}\nFingerprint: ${fp.full}\nFingerprintShort: ${fp.short}\n`,
+        commitMessage: payload.commitMessage || `Orky: ${key}`,
+        files: payload.files,
         labels: ["created-by-orky"],
-        meta: { jiraKey: key, fingerprint: fp.full, fingerprintShort: fp.short, runTimestamp: runTs },
-        proposal,
       });
 
-      const prUrl = pr?.url || pr?.html_url || pr?.prUrl || null;
-      if (!prUrl) throw new Error("PR creation returned no URL (expected pr.url)");
+      if (!pr?.prUrl) throw new Error("PR creation returned no prUrl");
 
       await jiraTransition(key, TRANSITION_ID_TO_IN_REVIEW);
-      await jiraAddComment(key, `PR opened: ${prUrl} | fingerprint ${fp.short}`);
+      await jiraAddComment(key, `PR opened: ${pr.prUrl} | fingerprint ${fp.short}`);
 
       results.processed += 1;
       results.items.push({
         jiraKey: key,
         outcome: "pr_created_moved_to_in_review",
-        prUrl,
+        prUrl: pr.prUrl,
         fingerprintShort: fp.short,
         repo: targetRepo,
-        branch: `${key}/${runTs}`,
+        branch: payload.branchName || `${key}/${runTs}`,
       });
     } catch (err) {
       results.failed += 1;
@@ -370,19 +385,28 @@ export async function runJiraScanner({ jiraKey } = {}) {
 }
 
 // ------------------- Vercel route handler -------------------
-// Jira Automation will call POST /api/brain/jira_scanner with JSON body { jiraKey: "ORKY-123" }
-export default async function handler(req, res) {
+// Jira Automation calls POST /api/brain/jira_scanner with JSON body { jiraKey: "ORKY-123" }
+export default async function jiraScannerHandler(req, res) {
   try {
+    const expected = mustGetEnv("ORKY_API_KEY");
+    const headerKey = req.headers["x-orky-key"];
+    const bearer = (req.headers.authorization || "").replace("Bearer ", "");
+    const provided = headerKey || bearer;
+
+    if (!provided || provided !== expected) {
+      return res.status(401).json({ ok: false, error: "Unauthorized" });
+    }
+
     if (req.method !== "POST") {
-      return res.status(405).json({ error: "Method Not Allowed. Use POST." });
+      return res.status(405).json({ ok: false, error: "Use POST" });
     }
 
     const body = typeof req.body === "string" ? JSON.parse(req.body || "{}") : (req.body || {});
     const jiraKey = body.jiraKey ? String(body.jiraKey).trim() : "";
 
     const result = await runJiraScanner({ jiraKey: jiraKey || undefined });
-    return res.status(200).json(result);
+    return res.status(200).json({ ok: true, result });
   } catch (e) {
-    return res.status(500).json({ error: String(e?.message || e) });
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 }
