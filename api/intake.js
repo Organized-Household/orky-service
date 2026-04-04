@@ -7,26 +7,44 @@
 //   OR
 //   Authorization: Bearer <ORKY_API_KEY>
 //
-// Modes (auto-detected):
+// Supported payload modes:
+//
 // A) Single Epic create:
-//    Body: { epicSummary, epicDescription?, fields? }
-// B) Single Story create under existing Epic (team-managed):
-//    Body: { epicKey: "ORKY-6", storySummary, storyDescription?, fields? }
-// C) Batch create (Epics + Stories):
 //    Body: {
-//      epics: [
+//      "PDEEpicID": "EPIC-1",
+//      "title": "EPIC-1 — Example Epic",
+//      "description": "Epic description"
+//    }
+//
+// B) Single Story create under existing Epic by Jira key:
+//    Body: {
+//      "epicKey": "OHHFIN-1",
+//      "PDEStoryID": "STORY-1.1",
+//      "PDEEpicID": "EPIC-1",
+//      "title": "STORY-1.1 — Example Story",
+//      "description": "Story description",
+//      "acceptanceCriteria": ["One", "Two", "Three"]
+//    }
+//
+// C) Batch create (merged epic + nested stories):
+//    Body: {
+//      "epics": [
 //        {
-//          epicSummary,
-//          epicDescription?,
-//          fields?: { ... },
-//          stories?: [
-//            { storySummary, storyDescription?, fields?: { ... } },
-//            ...
+//          "PDEEpicID": "EPIC-1",
+//          "title": "EPIC-1 — Example Epic",
+//          "description": "Epic description",
+//          "stories": [
+//            {
+//              "PDEStoryID": "STORY-1.1",
+//              "PDEEpicID": "EPIC-1",
+//              "title": "STORY-1.1 — Example Story",
+//              "description": "Story description",
+//              "acceptanceCriteria": ["One", "Two"]
+//            }
 //          ]
-//        },
-//        ...
+//        }
 //      ],
-//      options?: { dryRun?: boolean }
+//      "options": { "dryRun": false }
 //    }
 //
 // Required env vars:
@@ -36,19 +54,19 @@
 // - JIRA_API_TOKEN
 // - JIRA_PROJECT_KEY
 //
-// Optional env var:
-// - CREATE_STORY_UNDER_EPIC  "true" | "false" (Mode A only)
-//
-// Notes:
-// - Team-managed epic/story linkage uses `parent: { key: <EPIC_KEY> }` on Story.
-// - Batch continues on error per record and returns a success/failure report.
-// - `fields` lets you pass additional Jira fields (including customfield_XXXXX).
-//   Protected keys cannot be overridden.
+// Recommended env vars for custom fields:
+// - JIRA_FIELD_PDE_EPIC_ID
+// - JIRA_FIELD_PDE_STORY_ID
+// - JIRA_FIELD_ACCEPTANCE_CRITERIA
 
 function mustEnv(name) {
   const v = process.env[name];
   if (!v) throw new Error(`Missing env var: ${name}`);
   return v;
+}
+
+function getOptionalEnv(name) {
+  return process.env[name] || null;
 }
 
 function safeStr(v, max = 120) {
@@ -58,7 +76,6 @@ function safeStr(v, max = 120) {
 }
 
 function getProvidedOrkyKey(req) {
-  // Node/Next lowercases headers, but keep compatibility anyway
   const hdr =
     req.headers["x-orky-key"] ||
     req.headers["X-Orky-Key"] ||
@@ -121,8 +138,41 @@ function adf(text) {
   return {
     type: "doc",
     version: 1,
-    content: [{ type: "paragraph", content: [{ type: "text", text: String(text || "") }] }],
+    content: [
+      {
+        type: "paragraph",
+        content: [{ type: "text", text: String(text || "") }],
+      },
+    ],
   };
+}
+
+function normalizeAcceptanceCriteria(value) {
+  if (!value) return "";
+  if (Array.isArray(value)) {
+    return value.map((x) => `• ${String(x)}`).join("\n");
+  }
+  return String(value);
+}
+
+function applyCustomFields(targetFields, input = {}) {
+  const pdeEpicField = getOptionalEnv("JIRA_FIELD_PDE_EPIC_ID");
+  const pdeStoryField = getOptionalEnv("JIRA_FIELD_PDE_STORY_ID");
+  const acField = getOptionalEnv("JIRA_FIELD_ACCEPTANCE_CRITERIA");
+
+  if (pdeEpicField && input.PDEEpicID) {
+    targetFields[pdeEpicField] = String(input.PDEEpicID);
+  }
+
+  if (pdeStoryField && input.PDEStoryID) {
+    targetFields[pdeStoryField] = String(input.PDEStoryID);
+  }
+
+  if (acField && input.acceptanceCriteria) {
+    targetFields[acField] = normalizeAcceptanceCriteria(input.acceptanceCriteria);
+  }
+
+  return targetFields;
 }
 
 async function getCreateMetaFields(jira, projectKey, issueTypeName) {
@@ -160,9 +210,6 @@ function missingRequired(fieldsMeta, fieldsPayload) {
     .map(([fieldId, def]) => ({ fieldId, name: def?.name }));
 }
 
-/**
- * Merge extra fields while preventing overrides of core/protected keys.
- */
 function mergeExtraFields(baseFields, extraFields) {
   if (!extraFields || typeof extraFields !== "object") return baseFields;
 
@@ -183,22 +230,22 @@ function mergeExtraFields(baseFields, extraFields) {
 }
 
 async function createEpic(jira, myAccountId, input, { dryRun = false } = {}) {
-  const epicSummary = input?.epicSummary || "Orky - Epic";
-  const epicDescription = input?.epicDescription || "Created by Orky API.";
+  const epicTitle = input?.title || "Orky - Epic";
+  const epicDescription = input?.description || "Created by Orky API.";
   const extraFields = input?.fields;
 
   const epicMeta = await getCreateMetaFields(jira, jira.projectKey, "Epic");
 
   const epicFields = {
     project: { key: jira.projectKey },
-    summary: epicSummary,
+    summary: epicTitle,
     issuetype: { name: "Epic" },
     description: adf(epicDescription),
   };
 
   const epicNameFieldId = findEpicNameFieldId(epicMeta);
   if (epicNameFieldId && epicMeta[epicNameFieldId]?.required) {
-    epicFields[epicNameFieldId] = epicSummary;
+    epicFields[epicNameFieldId] = epicTitle;
   }
 
   if (epicMeta["reporter"]?.required) {
@@ -206,6 +253,7 @@ async function createEpic(jira, myAccountId, input, { dryRun = false } = {}) {
   }
 
   mergeExtraFields(epicFields, extraFields);
+  applyCustomFields(epicFields, input);
 
   const epicMissing = missingRequired(epicMeta, epicFields);
   if (epicMissing.length > 0) {
@@ -226,23 +274,26 @@ async function createEpic(jira, myAccountId, input, { dryRun = false } = {}) {
 }
 
 async function createStoryUnderEpic(jira, myAccountId, epicKey, input, { dryRun = false } = {}) {
-  // Optional: validate epic exists
-  await jiraFetch(jira, `/rest/api/3/issue/${encodeURIComponent(epicKey)}?fields=key,issuetype`, {
-    method: "GET",
-  });
+  if (!dryRun) {
+    await jiraFetch(
+      jira,
+      `/rest/api/3/issue/${encodeURIComponent(epicKey)}?fields=key,issuetype`,
+      { method: "GET" }
+    );
+  }
 
-  const storySummary = input?.storySummary || `Story under ${epicKey}`;
-  const storyDescription = input?.storyDescription || `Created by Orky API under Epic ${epicKey}.`;
+  const storyTitle = input?.title || `Story under ${epicKey}`;
+  const storyDescription = input?.description || `Created by Orky API under Epic ${epicKey}.`;
   const extraFields = input?.fields;
 
   const storyMeta = await getCreateMetaFields(jira, jira.projectKey, "Story");
 
   const storyFields = {
     project: { key: jira.projectKey },
-    summary: storySummary,
+    summary: storyTitle,
     issuetype: { name: "Story" },
     description: adf(storyDescription),
-    parent: { key: epicKey }, // team-managed link
+    parent: { key: epicKey },
   };
 
   if (storyMeta["reporter"]?.required) {
@@ -250,6 +301,7 @@ async function createStoryUnderEpic(jira, myAccountId, epicKey, input, { dryRun 
   }
 
   mergeExtraFields(storyFields, extraFields);
+  applyCustomFields(storyFields, input);
 
   const missing = missingRequired(storyMeta, storyFields);
   if (missing.length > 0) {
@@ -270,7 +322,6 @@ async function createStoryUnderEpic(jira, myAccountId, epicKey, input, { dryRun 
 }
 
 export default async function handler(req, res) {
-  // ===== ALWAYS LOG ENTRY (so we can prove the request reached Vercel) =====
   try {
     const hasXOrky = !!req.headers["x-orky-key"];
     const hasAuth = !!req.headers["authorization"];
@@ -285,10 +336,11 @@ export default async function handler(req, res) {
       bodyType: typeof req.body,
       hasEpicsArray: Array.isArray(req.body?.epics),
       hasEpicKey: !!req.body?.epicKey,
-      hasEpicSummary: !!req.body?.epicSummary,
+      hasTitle: !!req.body?.title,
+      hasPDEEpicID: !!req.body?.PDEEpicID,
+      hasPDEStoryID: !!req.body?.PDEStoryID,
     });
   } catch (e) {
-    // Logging should never kill the request
     console.log("[intake] hit-log-failed", e?.message || e);
   }
 
@@ -298,10 +350,8 @@ export default async function handler(req, res) {
       return res.status(405).json({ ok: false, error: "Use POST" });
     }
 
-    // 1) Orky auth
     assertOrkyAuth(req);
 
-    // 2) Jira config
     const jira = {
       baseUrl: mustEnv("JIRA_BASE_URL"),
       email: mustEnv("JIRA_EMAIL"),
@@ -311,7 +361,7 @@ export default async function handler(req, res) {
 
     const myAccountId = await getMyAccountId(jira);
 
-    // ===== MODE C: Batch =====
+    // MODE C: Batch merged payload
     if (Array.isArray(req.body?.epics)) {
       const dryRun = !!req.body?.options?.dryRun;
 
@@ -334,7 +384,8 @@ export default async function handler(req, res) {
         const epicIn = req.body.epics[i] || {};
         const epicItem = {
           index: i,
-          epicSummary: epicIn.epicSummary || null,
+          PDEEpicID: epicIn.PDEEpicID || null,
+          title: epicIn.title || null,
           epic: null,
           epicError: null,
           stories: [],
@@ -362,7 +413,9 @@ export default async function handler(req, res) {
           const storyIn = storiesIn[j] || {};
           const storyItem = {
             index: j,
-            storySummary: storyIn.storySummary || null,
+            PDEStoryID: storyIn.PDEStoryID || null,
+            PDEEpicID: storyIn.PDEEpicID || null,
+            title: storyIn.title || null,
             story: null,
             storyError: null,
           };
@@ -379,10 +432,14 @@ export default async function handler(req, res) {
           }
 
           try {
-            const keyToUse = dryRun ? (epicIn.epicKey || "DRYRUN-EPIC") : epicKey;
-            const createdStory = await createStoryUnderEpic(jira, myAccountId, keyToUse, storyIn, {
-              dryRun,
-            });
+            const keyToUse = dryRun ? "DRYRUN-EPIC" : epicKey;
+            const createdStory = await createStoryUnderEpic(
+              jira,
+              myAccountId,
+              keyToUse,
+              storyIn,
+              { dryRun }
+            );
             storyItem.story = createdStory;
             report.totals.storiesCreated += 1;
           } catch (e) {
@@ -403,59 +460,27 @@ export default async function handler(req, res) {
       return res.status(200).json(report);
     }
 
-    // ===== MODE B: Create Story under existing Epic =====
-    const epicKey = req.body?.epicKey;
-    if (epicKey) {
-      const storyIn = {
-        storySummary: req.body?.storySummary,
-        storyDescription: req.body?.storyDescription,
-        fields: req.body?.fields,
-      };
-
-      const created = await createStoryUnderEpic(jira, myAccountId, epicKey, storyIn, {
+    // MODE B: Single story under existing Epic Jira key
+    if (req.body?.epicKey) {
+      const created = await createStoryUnderEpic(jira, myAccountId, req.body.epicKey, req.body, {
         dryRun: false,
       });
 
       return res.status(200).json({
         ok: true,
         mode: "add-story",
-        epicKey,
+        epicKey: req.body.epicKey,
         story: created,
       });
     }
 
-    // ===== MODE A: Create Epic (optionally create story under it) =====
-    const CREATE_STORY_UNDER_EPIC =
-      (process.env.CREATE_STORY_UNDER_EPIC || "false").toLowerCase() === "true";
-
-    const epicIn = {
-      epicSummary: req.body?.epicSummary || "Orky - First API Epic",
-      epicDescription: req.body?.epicDescription || "Created by Orky via API.",
-      fields: req.body?.fields,
-    };
-
-    const epicCreate = await createEpic(jira, myAccountId, epicIn, { dryRun: false });
-    const epicCreatedKey = epicCreate?.key;
-
-    let storyCreate = null;
-    if (CREATE_STORY_UNDER_EPIC) {
-      const storyIn = {
-        storySummary: req.body?.storySummary || "Orky - First API Story",
-        storyDescription: req.body?.storyDescription || "Created under the Epic (team-managed).",
-        fields: req.body?.fields_story,
-      };
-
-      storyCreate = await createStoryUnderEpic(jira, myAccountId, epicCreatedKey, storyIn, {
-        dryRun: false,
-      });
-    }
+    // MODE A: Single Epic create
+    const createdEpic = await createEpic(jira, myAccountId, req.body || {}, { dryRun: false });
 
     return res.status(200).json({
       ok: true,
       mode: "create-epic",
-      epic: epicCreate,
-      story: storyCreate,
-      createdStory: CREATE_STORY_UNDER_EPIC,
+      epic: createdEpic,
     });
   } catch (e) {
     const status = e?.statusCode || 500;
