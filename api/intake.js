@@ -9,47 +9,6 @@
 //
 // Debug mode:
 //   GET /api/intake?debug=1
-//   Returns Jira auth + project diagnostics from the running Vercel runtime.
-//
-// Supported payload modes:
-//
-// A) Single Epic create:
-//    Body: {
-//      "PDEEpicID": "EPIC-1",
-//      "title": "EPIC-1 — Example Epic",
-//      "description": "Epic description"
-//    }
-//
-// B) Single Story create under existing Epic by Jira key:
-//    Body: {
-//      "epicKey": "OHHFIN-1",
-//      "PDEStoryID": "STORY-1.1",
-//      "PDEEpicID": "EPIC-1",
-//      "title": "STORY-1.1 — Example Story",
-//      "description": "Story description",
-//      "acceptanceCriteria": ["One", "Two", "Three"]
-//    }
-//
-// C) Batch create (merged epic + nested stories):
-//    Body: {
-//      "epics": [
-//        {
-//          "PDEEpicID": "EPIC-1",
-//          "title": "EPIC-1 — Example Epic",
-//          "description": "Epic description",
-//          "stories": [
-//            {
-//              "PDEStoryID": "STORY-1.1",
-//              "PDEEpicID": "EPIC-1",
-//              "title": "STORY-1.1 — Example Story",
-//              "description": "Story description",
-//              "acceptanceCriteria": ["One", "Two"]
-//            }
-//          ]
-//        }
-//      ],
-//      "options": { "dryRun": false }
-//    }
 //
 // Required env vars:
 // - ORKY_API_KEY
@@ -168,12 +127,32 @@ function adf(text) {
   };
 }
 
-function normalizeAcceptanceCriteria(value) {
-  if (!value) return "";
-  if (Array.isArray(value)) {
-    return value.map((x) => `• ${String(x)}`).join("\n");
+function adfFromLines(lines) {
+  const arr = Array.isArray(lines) ? lines : [String(lines || "")];
+  const content = [];
+
+  for (const line of arr) {
+    const text = String(line || "").trim();
+    if (!text) continue;
+
+    content.push({
+      type: "paragraph",
+      content: [{ type: "text", text }],
+    });
   }
-  return String(value);
+
+  if (content.length === 0) {
+    content.push({
+      type: "paragraph",
+      content: [{ type: "text", text: "" }],
+    });
+  }
+
+  return {
+    type: "doc",
+    version: 1,
+    content,
+  };
 }
 
 function applyCustomFields(targetFields, input = {}) {
@@ -189,8 +168,9 @@ function applyCustomFields(targetFields, input = {}) {
     targetFields[pdeStoryField] = String(input.PDEStoryID);
   }
 
+  // FIX: Acceptance Criteria must be sent as ADF, not plain text
   if (acField && input.acceptanceCriteria) {
-    targetFields[acField] = normalizeAcceptanceCriteria(input.acceptanceCriteria);
+    targetFields[acField] = adfFromLines(input.acceptanceCriteria);
   }
 
   return targetFields;
@@ -343,7 +323,6 @@ async function createStoryUnderEpic(jira, myAccountId, epicKey, input, { dryRun 
 }
 
 export default async function handler(req, res) {
-  // Optional browser support for same-origin tester page
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, x-orky-key, Authorization");
@@ -360,7 +339,6 @@ export default async function handler(req, res) {
       projectKey: mustEnv("JIRA_PROJECT_KEY"),
     };
 
-    // Temporary runtime diagnostic mode
     if (req.method === "GET" && req.query?.debug === "1") {
       const myself = await jiraFetchRaw(jira, "/rest/api/3/myself", { method: "GET" });
       const project = await jiraFetchRaw(
