@@ -2,10 +2,14 @@
 //
 // POST /api/intake
 //
-// Auth (required):
+// Auth (required for POST):
 //   Header: x-orky-key: <ORKY_API_KEY>   (recommended)
 //   OR
 //   Authorization: Bearer <ORKY_API_KEY>
+//
+// Debug mode:
+//   GET /api/intake?debug=1
+//   Returns Jira auth + project diagnostics from the running Vercel runtime.
 //
 // Supported payload modes:
 //
@@ -69,10 +73,8 @@ function getOptionalEnv(name) {
   return process.env[name] || null;
 }
 
-function safeStr(v, max = 120) {
-  const s = String(v ?? "");
-  if (s.length <= max) return s;
-  return s.slice(0, max) + "...";
+function normalizeBaseUrl(url) {
+  return String(url || "").replace(/\/+$/, "");
 }
 
 function getProvidedOrkyKey(req) {
@@ -132,6 +134,25 @@ async function jiraFetch(jira, path, init = {}) {
     throw err;
   }
   return json;
+}
+
+async function jiraFetchRaw(jira, path, init = {}) {
+  const res = await fetch(`${jira.baseUrl}${path}`, {
+    ...init,
+    headers: {
+      Authorization: authHeader(jira.email, jira.apiToken),
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      ...(init.headers || {}),
+    },
+  });
+
+  const text = await res.text();
+  return {
+    status: res.status,
+    ok: res.ok,
+    body: text,
+  };
 }
 
 function adf(text) {
@@ -322,42 +343,75 @@ async function createStoryUnderEpic(jira, myAccountId, epicKey, input, { dryRun 
 }
 
 export default async function handler(req, res) {
-  try {
-    const hasXOrky = !!req.headers["x-orky-key"];
-    const hasAuth = !!req.headers["authorization"];
-    const provided = getProvidedOrkyKey(req);
-    console.log("[intake] hit", {
-      method: req.method,
-      url: req.url,
-      contentType: req.headers["content-type"],
-      hasXOrky,
-      hasAuth,
-      providedKeyLen: provided ? String(provided).length : 0,
-      bodyType: typeof req.body,
-      hasEpicsArray: Array.isArray(req.body?.epics),
-      hasEpicKey: !!req.body?.epicKey,
-      hasTitle: !!req.body?.title,
-      hasPDEEpicID: !!req.body?.PDEEpicID,
-      hasPDEStoryID: !!req.body?.PDEStoryID,
-    });
-  } catch (e) {
-    console.log("[intake] hit-log-failed", e?.message || e);
+  // Optional browser support for same-origin tester page
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, x-orky-key, Authorization");
+
+  if (req.method === "OPTIONS") {
+    return res.status(200).end();
   }
 
   try {
-    if (req.method !== "POST") {
-      res.setHeader("Allow", "POST");
-      return res.status(405).json({ ok: false, error: "Use POST" });
-    }
-
-    assertOrkyAuth(req);
-
     const jira = {
-      baseUrl: mustEnv("JIRA_BASE_URL"),
+      baseUrl: normalizeBaseUrl(mustEnv("JIRA_BASE_URL")),
       email: mustEnv("JIRA_EMAIL"),
       apiToken: mustEnv("JIRA_API_TOKEN"),
       projectKey: mustEnv("JIRA_PROJECT_KEY"),
     };
+
+    // Temporary runtime diagnostic mode
+    if (req.method === "GET" && req.query?.debug === "1") {
+      const myself = await jiraFetchRaw(jira, "/rest/api/3/myself", { method: "GET" });
+      const project = await jiraFetchRaw(
+        jira,
+        `/rest/api/3/project/${encodeURIComponent(jira.projectKey)}`,
+        { method: "GET" }
+      );
+
+      return res.status(200).json({
+        ok: true,
+        debug: true,
+        envSeenByRuntime: {
+          baseUrl: jira.baseUrl,
+          email: jira.email,
+          projectKey: jira.projectKey,
+          tokenLength: jira.apiToken.length,
+          tokenLast6: jira.apiToken.slice(-6),
+        },
+        myself,
+        project,
+      });
+    }
+
+    try {
+      const hasXOrky = !!req.headers["x-orky-key"];
+      const hasAuth = !!req.headers["authorization"];
+      const provided = getProvidedOrkyKey(req);
+      console.log("[intake] hit", {
+        method: req.method,
+        url: req.url,
+        contentType: req.headers["content-type"],
+        hasXOrky,
+        hasAuth,
+        providedKeyLen: provided ? String(provided).length : 0,
+        bodyType: typeof req.body,
+        hasEpicsArray: Array.isArray(req.body?.epics),
+        hasEpicKey: !!req.body?.epicKey,
+        hasTitle: !!req.body?.title,
+        hasPDEEpicID: !!req.body?.PDEEpicID,
+        hasPDEStoryID: !!req.body?.PDEStoryID,
+      });
+    } catch (e) {
+      console.log("[intake] hit-log-failed", e?.message || e);
+    }
+
+    if (req.method !== "POST") {
+      res.setHeader("Allow", "GET, POST, OPTIONS");
+      return res.status(405).json({ ok: false, error: "Use POST or GET ?debug=1" });
+    }
+
+    assertOrkyAuth(req);
 
     const myAccountId = await getMyAccountId(jira);
 
