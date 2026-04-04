@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OHh Intake Tester</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background: #f4f4f4;
+      margin: 0;
+      padding: 32px;
+      color: #222;
+    }
+
+    .card {
+      max-width: 760px;
+      margin: 0 auto;
+      background: #fff;
+      border-radius: 12px;
+      padding: 24px;
+      box-shadow: 0 4px 18px rgba(0, 0, 0, 0.08);
+    }
+
+    h1 {
+      margin-top: 0;
+      font-size: 28px;
+    }
+
+    p {
+      line-height: 1.5;
+    }
+
+    label {
+      display: block;
+      margin-top: 16px;
+      margin-bottom: 6px;
+      font-weight: 600;
+    }
+
+    input[type="text"],
+    input[type="password"],
+    textarea,
+    select {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 12px;
+      border: 1px solid #ccc;
+      border-radius: 8px;
+      font-size: 14px;
+      background: #fff;
+    }
+
+    input[type="file"] {
+      margin-top: 8px;
+    }
+
+    .row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+    }
+
+    .actions {
+      margin-top: 24px;
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    button {
+      border: none;
+      background: #111;
+      color: white;
+      padding: 12px 18px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 14px;
+    }
+
+    button.secondary {
+      background: #666;
+    }
+
+    button:hover {
+      opacity: 0.92;
+    }
+
+    .note {
+      margin-top: 18px;
+      padding: 12px;
+      background: #f8f8f8;
+      border-left: 4px solid #999;
+      border-radius: 6px;
+      font-size: 14px;
+    }
+
+    .status {
+      margin-top: 18px;
+      font-weight: 600;
+    }
+
+    pre {
+      margin-top: 12px;
+      background: #111;
+      color: #d7ffd7;
+      padding: 16px;
+      border-radius: 8px;
+      overflow: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+      min-height: 140px;
+    }
+
+    .small {
+      font-size: 13px;
+      color: #555;
+    }
+
+    @media (max-width: 700px) {
+      .row {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>OHh Intake Tester</h1>
+    <p>
+      Upload a merged JSON payload and send it to your <code>/api/intake</code> endpoint.
+    </p>
+
+    <label for="endpoint">API Endpoint</label>
+    <input
+      id="endpoint"
+      type="text"
+      value="/api/intake"
+    />
+
+    <div class="row">
+      <div>
+        <label for="apiKey">ORKY API Key</label>
+        <input
+          id="apiKey"
+          type="password"
+          placeholder="Paste your ORKY_API_KEY"
+        />
+      </div>
+      <div>
+        <label for="fileInput">JSON File</label>
+        <input
+          id="fileInput"
+          type="file"
+          accept=".json,application/json"
+        />
+      </div>
+    </div>
+
+    <label for="payloadPreview">Payload Preview</label>
+    <textarea
+      id="payloadPreview"
+      rows="14"
+      placeholder="Selected file contents will appear here..."
+    ></textarea>
+
+    <div class="actions">
+      <button id="loadBtn" type="button">Load File</button>
+      <button id="sendBtn" type="button">Submit to Intake API</button>
+      <button id="clearBtn" type="button" class="secondary">Clear</button>
+    </div>
+
+    <div class="note">
+      Recommended test first: 1 Epic + 2 Stories only.
+    </div>
+
+    <div id="status" class="status"></div>
+    <pre id="result">No request sent yet.</pre>
+
+    <p class="small">
+      Tip: if this page is served from the same Vercel project as your API, using <code>/api/intake</code> avoids most browser CORS problems.
+    </p>
+  </div>
+
+  <script>
+    const endpointEl = document.getElementById("endpoint");
+    const apiKeyEl = document.getElementById("apiKey");
+    const fileInputEl = document.getElementById("fileInput");
+    const payloadPreviewEl = document.getElementById("payloadPreview");
+    const statusEl = document.getElementById("status");
+    const resultEl = document.getElementById("result");
+
+    document.getElementById("loadBtn").addEventListener("click", loadFile);
+    document.getElementById("sendBtn").addEventListener("click", sendPayload);
+    document.getElementById("clearBtn").addEventListener("click", clearForm);
+    fileInputEl.addEventListener("change", loadFile);
+
+    async function loadFile() {
+      const file = fileInputEl.files[0];
+      if (!file) {
+        statusEl.textContent = "Please choose a JSON file first.";
+        return;
+      }
+
+      try {
+        const text = await file.text();
+        JSON.parse(text);
+        payloadPreviewEl.value = text;
+        statusEl.textContent = `Loaded file: ${file.name}`;
+      } catch (err) {
+        statusEl.textContent = "Could not read valid JSON file.";
+        resultEl.textContent = err.message;
+      }
+    }
+
+    async function sendPayload() {
+      const endpoint = endpointEl.value.trim();
+      const apiKey = apiKeyEl.value.trim();
+      const payloadText = payloadPreviewEl.value.trim();
+
+      if (!endpoint) {
+        statusEl.textContent = "Endpoint is required.";
+        return;
+      }
+
+      if (!apiKey) {
+        statusEl.textContent = "ORKY API Key is required.";
+        return;
+      }
+
+      if (!payloadText) {
+        statusEl.textContent = "Load or paste a JSON payload first.";
+        return;
+      }
+
+      let parsed;
+      try {
+        parsed = JSON.parse(payloadText);
+      } catch (err) {
+        statusEl.textContent = "Payload is not valid JSON.";
+        resultEl.textContent = err.message;
+        return;
+      }
+
+      statusEl.textContent = "Sending request...";
+      resultEl.textContent = "";
+
+      try {
+        const response = await fetch(endpoint, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-orky-key": apiKey
+          },
+          body: JSON.stringify(parsed)
+        });
+
+        const raw = await response.text();
+
+        let output;
+        try {
+          output = JSON.stringify(JSON.parse(raw), null, 2);
+        } catch {
+          output = raw;
+        }
+
+        statusEl.textContent = `Request completed. HTTP ${response.status}`;
+        resultEl.textContent = output;
+      } catch (err) {
+        statusEl.textContent = "Request failed.";
+        resultEl.textContent = err.message;
+      }
+    }
+
+    function clearForm() {
+      fileInputEl.value = "";
+      payloadPreviewEl.value = "";
+      statusEl.textContent = "";
+      resultEl.textContent = "No request sent yet.";
+    }
+  </script>
+</body>
+</html>
